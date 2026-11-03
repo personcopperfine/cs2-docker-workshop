@@ -1,5 +1,5 @@
 ### SteamCMD Install ###
-FROM registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk as steamcmd
+FROM registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk AS steamcmd
 # stage https://github.com/steamcmd/docker under MIT
 #
 # MIT License
@@ -24,8 +24,8 @@ FROM registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk as steamcmd
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-ENV USER root
-ENV HOME /root
+ENV USER=root
+ENV HOME=/root
 
 WORKDIR $HOME
 
@@ -106,8 +106,8 @@ ARG PROTON="4628710"
 # into a scratch image, so nothing below hardcodes an absolute path.
 ARG GAME_DIR=/app
 ENV GAME_DIR="${GAME_DIR}"
-ENV HOME "/home/steam"
-ENV STEAM_APP_ID "730"
+ENV HOME="/home/steam"
+ENV STEAM_APP_ID="730"
 
 RUN mkdir -p /home/steam/.steam
 WORKDIR /home/steam
@@ -169,7 +169,7 @@ COPY --from=rescompilerbuilder /src/CS2MapCompiler/bin/Release/CS2MapCompiler.ex
 FROM registry.gitlab.steamos.cloud/steamrt/steamrt4/sdk AS protonsetup
 
 ARG GAME_DIR=/app
-ENV STEAM_APP_ID "730"
+ENV STEAM_APP_ID="730"
 ENV GAME_DIR="${GAME_DIR}"
 ENV COMPATDATA="${GAME_DIR}/compatdata/${STEAM_APP_ID}"
 ENV WINEPREFIX="${COMPATDATA}/pfx"
