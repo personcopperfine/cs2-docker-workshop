@@ -20,7 +20,8 @@ permissions:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    # steamcmd's app_info_print returns no app data on ubuntu-26.04 runners (ubuntu-latest since Oct 2026)
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     outputs:
       hash: ${{ steps.manifests.outputs.hash }}
@@ -101,6 +102,7 @@ jobs:
                 exit 0
               fi
               echo "::warning::${mode} login, attempt ${attempt}: depot manifests not found"
+              tail -n 20 appinfo.txt || true
               sleep 10
             done
           done
@@ -126,7 +128,7 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.changed == 'true' || inputs.force
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - name: Free disk space
