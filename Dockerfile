@@ -274,6 +274,12 @@ RUN chmod +x ${GAME_DIR}/entrypoint.sh
 WORKDIR ${GAME_DIR}
 ENTRYPOINT ["./entrypoint.sh"]
 
+### Build info: the Proton build the tree got (app_update takes the latest) ###
+# Not part of the image; CI exports this stage (target buildinfo) for the release notes.
+FROM scratch AS buildinfo
+ARG GAME_DIR=/app
+COPY --from=gameinstall ${GAME_DIR}/version ${GAME_DIR}/steamapps/appmanifest_4628710.acf /
+
 ### Final: scratch image of just the files ###
 # File source, not a runtime: this stage exists so other images can pull the
 # licensed content (game tree + Proton/wine prefix) out of it, e.g.

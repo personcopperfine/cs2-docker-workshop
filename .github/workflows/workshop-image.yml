@@ -28,7 +28,6 @@ jobs:
       manifest_2347779: ${{ steps.manifests.outputs.manifest_2347779 }}
       manifest_2347771: ${{ steps.manifests.outputs.manifest_2347771 }}
       build_id: ${{ steps.manifests.outputs.build_id }}
-      proton_build_id: ${{ steps.manifests.outputs.proton_build_id }}
       changed: ${{ steps.registry.outputs.changed }}
     steps:
       - id: image
@@ -79,7 +78,6 @@ jobs:
               sys.exit("app 730 missing from app_info_print output")
           # informational (release notes): an empty value only fails the release job
           build_id = public_build(cs2)
-          proton_build_id = public_build(app("4628710"))
 
           depots = cs2.get("depots", {})
           values = []
@@ -97,12 +95,10 @@ jobs:
                   output.write(f"manifest_{depot}={gid}\n")
               output.write(f"hash={digest}\n")
               output.write(f"build_id={build_id}\n")
-              output.write(f"proton_build_id={proton_build_id}\n")
           for depot, gid in values:
               print(f"depot {depot}: manifest {gid}")
           print(f"hash: {digest}")
           print(f"app 730 public build: {build_id or 'unknown'}")
-          print(f"app 4628710 (Proton) public build: {proton_build_id or 'unknown'}")
           PY
           }
 
@@ -119,7 +115,6 @@ jobs:
                 +login "${login[@]}" \
                 +app_info_update 1 \
                 +app_info_print 730 \
-                +app_info_print 4628710 \
                 +quit > appinfo.txt || true
               if parse; then
                 exit 0
@@ -156,6 +151,8 @@ jobs:
     outputs:
       digest: ${{ steps.push.outputs.digest }}
       built_at: ${{ steps.built.outputs.at }}
+      proton_build_id: ${{ steps.built.outputs.proton_build_id }}
+      proton_version: ${{ steps.built.outputs.proton_version }}
     steps:
       - name: Free disk space
         run: |
@@ -200,8 +197,31 @@ jobs:
             steam_username=${{ secrets.USERNAME }}
             steam_password=${{ secrets.PASSWORD }}
 
+      # the Proton build the image got, from the (cached) buildinfo stage
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ./Dockerfile
+          target: buildinfo
+          outputs: type=local,dest=buildinfo
+          provenance: false
+          build-args: |
+            MANIFEST_2347779=${{ needs.check.outputs.manifest_2347779 }}
+            MANIFEST_2347771=${{ needs.check.outputs.manifest_2347771 }}
+          secrets: |
+            steam_username=${{ secrets.USERNAME }}
+            steam_password=${{ secrets.PASSWORD }}
+
       - id: built
-        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+          # only these two values: the appmanifest also names the Steam account (LastOwner)
+          build_id=$(sed -n 's/^[[:space:]]*"buildid"[[:space:]]*"\([0-9]*\)".*/\1/p' buildinfo/appmanifest_4628710.acf | head -n 1)
+          version=$(awk '{print $2}' buildinfo/version)
+          echo "Proton: build ${build_id:-unknown}, ${version:-unknown}"
+          echo "proton_build_id=${build_id}" >> "$GITHUB_OUTPUT"
+          echo "proton_version=${version}" >> "$GITHUB_OUTPUT"
 
       - if: always()
         run: df -h /
@@ -234,7 +254,8 @@ jobs:
           BUILT_AT: ${{ needs.build.outputs.built_at }}
           DEPOTS_HASH: ${{ needs.check.outputs.hash }}
           BUILD_ID: ${{ needs.check.outputs.build_id }}
-          PROTON_BUILD_ID: ${{ needs.check.outputs.proton_build_id }}
+          PROTON_BUILD_ID: ${{ needs.build.outputs.proton_build_id }}
+          PROTON_VERSION: ${{ needs.build.outputs.proton_version }}
           MANIFEST_2347779: ${{ needs.check.outputs.manifest_2347779 }}
           MANIFEST_2347771: ${{ needs.check.outputs.manifest_2347771 }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -291,8 +312,8 @@ jobs:
               },
               "proton": {
                   "app_id": int(env["PROTON_APP_ID"]),
-                  # app_update installs the latest public build; this is the one public at check time
                   "build_id": env["PROTON_BUILD_ID"] or None,
+                  "version": env["PROTON_VERSION"] or None,
               },
               "rescompiler": {
                   "repository": "https://github.com/dirtkiller23/CS2ResourceCompiler",
@@ -310,7 +331,7 @@ jobs:
 
           gib = f"{size / 2**30:.1f} GiB compressed" if size else "size unknown"
           download = f"https://github.com/{repo}/releases/download/{tag}"
-          proton = env["PROTON_BUILD_ID"] or "unknown"
+          proton = f"build `{env['PROTON_BUILD_ID'] or 'unknown'}`, `{env['PROTON_VERSION'] or 'unknown'}`"
           notes = f"""CS2 + Workshop Tools (Windows depots, Proton app {env['PROTON_APP_ID']}) file image for Steam build **{env['BUILD_ID']}**.
 
           ## Docker
@@ -335,7 +356,7 @@ jobs:
           | Steam app 730 public build | `{env['BUILD_ID']}` |
           | Depot 2347779 manifest | `{depots['2347779']}` |
           | Depot 2347771 manifest | `{depots['2347771']}` |
-          | Proton app {env['PROTON_APP_ID']} | public build `{proton}` at check time (`app_update` takes the latest) |
+          | Proton app {env['PROTON_APP_ID']} | {proton} |
           | CS2ResourceCompiler | [`{env['RESCOMPILER_SHA'][:12]}`](https://github.com/dirtkiller23/CS2ResourceCompiler/commit/{env['RESCOMPILER_SHA']}) |
           | Source | [`{env['GITHUB_SHA'][:12]}`](https://github.com/{repo}/commit/{env['GITHUB_SHA']}) |
           | Built | {env['BUILT_AT']}, [workflow run]({env['RUN_URL']}) |
