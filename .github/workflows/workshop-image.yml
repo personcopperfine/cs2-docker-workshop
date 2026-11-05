@@ -27,6 +27,8 @@ jobs:
       hash: ${{ steps.manifests.outputs.hash }}
       manifest_2347779: ${{ steps.manifests.outputs.manifest_2347779 }}
       manifest_2347771: ${{ steps.manifests.outputs.manifest_2347771 }}
+      build_id: ${{ steps.manifests.outputs.build_id }}
+      proton_build_id: ${{ steps.manifests.outputs.proton_build_id }}
       changed: ${{ steps.registry.outputs.changed }}
     steps:
       - id: image
@@ -43,27 +45,43 @@ jobs:
           import hashlib, os, re, sys
 
           text = open("appinfo.txt", encoding="utf-8", errors="replace").read()
-          match = re.search(r'^"730"\s*\{', text, re.M)
-          if not match:
+
+
+          def app(appid):
+              match = re.search(rf'^"{appid}"\s*\{{', text, re.M)
+              if not match:
+                  return None
+              root, key = {}, None
+              stack = [root]
+              for string, brace in re.findall(r'"((?:[^"\\]|\\.)*)"|([{}])', text[match.start():]):
+                  if brace == "{":
+                      stack[-1][key] = {}
+                      stack.append(stack[-1][key])
+                      key = None
+                  elif brace == "}":
+                      stack.pop()
+                      if len(stack) == 1:
+                          break
+                  elif key is None:
+                      key = string
+                  else:
+                      stack[-1][key], key = string, None
+              return root[appid]
+
+
+          def public_build(info):
+              public = (info or {}).get("depots", {}).get("branches", {}).get("public", {})
+              return public.get("buildid", "") if isinstance(public, dict) else ""
+
+
+          cs2 = app("730")
+          if cs2 is None:
               sys.exit("app 730 missing from app_info_print output")
+          # informational (release notes): an empty value only fails the release job
+          build_id = public_build(cs2)
+          proton_build_id = public_build(app("4628710"))
 
-          root, key = {}, None
-          stack = [root]
-          for string, brace in re.findall(r'"((?:[^"\\]|\\.)*)"|([{}])', text[match.start():]):
-              if brace == "{":
-                  stack[-1][key] = {}
-                  stack.append(stack[-1][key])
-                  key = None
-              elif brace == "}":
-                  stack.pop()
-                  if len(stack) == 1:
-                      break
-              elif key is None:
-                  key = string
-              else:
-                  stack[-1][key], key = string, None
-
-          depots = root["730"].get("depots", {})
+          depots = cs2.get("depots", {})
           values = []
           for depot in ("2347779", "2347771"):
               public = depots.get(depot, {}).get("manifests", {}).get("public")
@@ -78,9 +96,13 @@ jobs:
               for depot, gid in values:
                   output.write(f"manifest_{depot}={gid}\n")
               output.write(f"hash={digest}\n")
+              output.write(f"build_id={build_id}\n")
+              output.write(f"proton_build_id={proton_build_id}\n")
           for depot, gid in values:
               print(f"depot {depot}: manifest {gid}")
           print(f"hash: {digest}")
+          print(f"app 730 public build: {build_id or 'unknown'}")
+          print(f"app 4628710 (Proton) public build: {proton_build_id or 'unknown'}")
           PY
           }
 
@@ -97,6 +119,7 @@ jobs:
                 +login "${login[@]}" \
                 +app_info_update 1 \
                 +app_info_print 730 \
+                +app_info_print 4628710 \
                 +quit > appinfo.txt || true
               if parse; then
                 exit 0
@@ -130,6 +153,9 @@ jobs:
     if: needs.check.outputs.changed == 'true' || inputs.force
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      built_at: ${{ steps.built.outputs.at }}
     steps:
       - name: Free disk space
         run: |
@@ -152,7 +178,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/build-push-action@v7
+      - id: push
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
@@ -173,5 +200,187 @@ jobs:
             steam_username=${{ secrets.USERNAME }}
             steam_password=${{ secrets.PASSWORD }}
 
+      - id: built
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
       - if: always()
         run: df -h /
+
+  # One release per pushed image digest, tag build-<steam build id>-<digest[:12]>:
+  # sortable by Steam build, and a rerun for the same image updates its release.
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - id: image
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/cs2-workshop" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          BUILT_AT: ${{ needs.build.outputs.built_at }}
+          DEPOTS_HASH: ${{ needs.check.outputs.hash }}
+          BUILD_ID: ${{ needs.check.outputs.build_id }}
+          PROTON_BUILD_ID: ${{ needs.check.outputs.proton_build_id }}
+          MANIFEST_2347779: ${{ needs.check.outputs.manifest_2347779 }}
+          MANIFEST_2347771: ${{ needs.check.outputs.manifest_2347771 }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest from the build job: '${DIGEST}'"; exit 1; }
+          [[ "$BUILD_ID" =~ ^[0-9]+$ ]] || { echo "::error::no Steam build id from the check job: '${BUILD_ID}'"; exit 1; }
+          # the digest must be what the registry serves under the tag the build pushed
+          docker buildx imagetools inspect --raw "${IMAGE}:depots-${DEPOTS_HASH}" > manifest.json
+          tagged="sha256:$(sha256sum < manifest.json | cut -d' ' -f1)"
+          [ "$tagged" = "$DIGEST" ] || { echo "::error::${IMAGE}:depots-${DEPOTS_HASH} is ${tagged}, the build pushed ${DIGEST}"; exit 1; }
+
+          tag="build-${BUILD_ID}-${DIGEST:7:12}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          mkdir dist
+          cp entrypoint.sh dist/entrypoint.sh
+          git archive --format=tar.gz --prefix=cs2-workshop/ -o dist/cs2-workshop-scripts.tar.gz HEAD Dockerfile entrypoint.sh .containerignore
+          TAG="$tag" \
+            PROTON_APP_ID=$(sed -n 's/^ARG PROTON="\([0-9]*\)"$/\1/p' Dockerfile) \
+            RESCOMPILER_SHA=$(sed -n 's/^ARG RESCOMPILER_SHA=\([0-9a-f]*\)$/\1/p' Dockerfile) \
+            python3 - <<'PY'
+          import hashlib, json, os
+
+          env = os.environ
+          for key in ("PROTON_APP_ID", "RESCOMPILER_SHA"):
+              if not env[key]:
+                  raise SystemExit(f"{key} not found in Dockerfile")
+
+          image, digest, tag, repo = env["IMAGE"], env["DIGEST"], env["TAG"], env["GITHUB_REPOSITORY"]
+          manifest = json.load(open("manifest.json"))
+          size = sum(layer["size"] for layer in manifest.get("layers", [])) or None
+          depots = {"2347779": env["MANIFEST_2347779"], "2347771": env["MANIFEST_2347771"]}
+          tags = [f"{image}:depots-{env['DEPOTS_HASH']}", f"{image}:latest"]
+
+
+          def sha256(path):
+              return hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+
+          release = {
+              "schema": 1,
+              "release": tag,
+              "repository": repo,
+              "image": image,
+              "digest": digest,
+              "reference": f"{image}@{digest}",
+              "tags": tags,
+              "compressed_size": size,
+              "steam": {
+                  "app_id": 730,
+                  "build_id": env["BUILD_ID"],
+                  "depots": depots,
+                  "depots_hash": env["DEPOTS_HASH"],
+              },
+              "proton": {
+                  "app_id": int(env["PROTON_APP_ID"]),
+                  # app_update installs the latest public build; this is the one public at check time
+                  "build_id": env["PROTON_BUILD_ID"] or None,
+              },
+              "rescompiler": {
+                  "repository": "https://github.com/dirtkiller23/CS2ResourceCompiler",
+                  "sha": env["RESCOMPILER_SHA"],
+              },
+              "git_sha": env["GITHUB_SHA"],
+              "built_at": env["BUILT_AT"],
+              "workflow_run": env["RUN_URL"],
+              "assets": {name: {"sha256": sha256(f"dist/{name}")}
+                         for name in ("entrypoint.sh", "cs2-workshop-scripts.tar.gz")},
+          }
+          with open("dist/release.json", "w", encoding="utf-8") as out:
+              json.dump(release, out, indent=2)
+              out.write("\n")
+
+          gib = f"{size / 2**30:.1f} GiB compressed" if size else "size unknown"
+          download = f"https://github.com/{repo}/releases/download/{tag}"
+          proton = env["PROTON_BUILD_ID"] or "unknown"
+          notes = f"""CS2 + Workshop Tools (Windows depots, Proton app {env['PROTON_APP_ID']}) file image for Steam build **{env['BUILD_ID']}**.
+
+          ## Docker
+
+          ```sh
+          docker pull {image}@{digest}
+          ```
+
+          | | |
+          |---|---|
+          | Digest | `{image}@{digest}` |
+          | Tags when released | `{tags[0]}` (one per depot pair), `{tags[1]}` (moves) |
+          | Size | {gib} |
+
+          The image is a file source (`FROM scratch`): copy the tree out of it, e.g.
+          `COPY --from={image}@{digest} /app/ /app/`. Pin the digest, not a tag.
+
+          ## Built from
+
+          | | |
+          |---|---|
+          | Steam app 730 public build | `{env['BUILD_ID']}` |
+          | Depot 2347779 manifest | `{depots['2347779']}` |
+          | Depot 2347771 manifest | `{depots['2347771']}` |
+          | Proton app {env['PROTON_APP_ID']} | public build `{proton}` at check time (`app_update` takes the latest) |
+          | CS2ResourceCompiler | [`{env['RESCOMPILER_SHA'][:12]}`](https://github.com/dirtkiller23/CS2ResourceCompiler/commit/{env['RESCOMPILER_SHA']}) |
+          | Source | [`{env['GITHUB_SHA'][:12]}`](https://github.com/{repo}/commit/{env['GITHUB_SHA']}) |
+          | Built | {env['BUILT_AT']}, [workflow run]({env['RUN_URL']}) |
+
+          ## Native Linux
+
+          The assets hold no Valve or Proton files. Fetch them yourself with steamcmd:
+          `+@sSteamCmdForcePlatformType windows +download_depot 730 2347779 {depots['2347779']}`
+          `+download_depot 730 2347771 {depots['2347771']}`, merge both `depot_*` directories into one tree,
+          `+app_update {env['PROTON_APP_ID']}` (Proton) into that tree, then set up the wine prefix. The `Dockerfile`
+          stages `gameinstall` and `protonsetup` are the exact steps.
+
+          - `entrypoint.sh`: the launcher; put it at the root of that tree and it derives wine's environment from its location.
+          - `cs2-workshop-scripts.tar.gz`: `Dockerfile` (the full recipe) and `entrypoint.sh` at this commit.
+          - CS2MapCompiler.exe is not attached: CS2ResourceCompiler has no license, so its build is not redistributed here.
+
+          ## Pinning
+
+          `release.json` names the image, digest, tags, depot manifests, Proton app, CS2ResourceCompiler commit, source commit,
+          build date and the SHA-256 of each asset; `SHA256SUMS` covers every asset.
+
+          ```sh
+          curl -fsSLO {download}/release.json
+          docker pull "$(jq -r .reference release.json)"
+          ```
+
+          The newest release is always at `https://github.com/{repo}/releases/latest/download/release.json`.
+          """
+          with open("notes.md", "w", encoding="utf-8") as out:
+              out.write(notes)
+          PY
+          (cd dist && sha256sum release.json entrypoint.sh cs2-workshop-scripts.tar.gz > SHA256SUMS)
+          cat dist/release.json
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          TITLE: CS2 build ${{ needs.check.outputs.build_id }} (depots-${{ needs.check.outputs.hash }})
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "release ${TAG} exists (same image digest): updating notes and assets"
+            gh release edit "$TAG" --title "$TITLE" --notes-file notes.md
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TITLE" --notes-file notes.md --latest
+          fi
